@@ -1,1 +1,194 @@
+import math
 
+# ---------- Константы ----------
+DT = 0.2
+PIT_CLIFF = 1.15
+PIT_NEG_STREAK = 2
+OBS_NEAR = 1.3
+OBS_MID = 2.5
+DESCENT_PITCH = 0.10
+REVERSE_TIME = 0.6
+STUCK_TIME = 1.0
+
+# ---------- Утилиты ----------
+def wrap(a):
+    while a > math.pi:  a -= 2 * math.pi
+    while a < -math.pi: a += 2 * math.pi
+    return a
+
+def dist_ok(d):
+    return d if d >= 0 else 9.0
+
+class EMA:
+    def __init__(self, alpha=0.5):
+        self.alpha = alpha
+        self.v = None
+    def update(self, x):
+        self.v = x if self.v is None else self.alpha * x + (1 - self.alpha) * self.v
+        return self.v
+
+class PID:
+    def __init__(self, kp, ki, kd, imax=1.5):
+        self.kp, self.ki, self.kd, self.imax = kp, ki, kd, imax
+        self.i = 0.0
+        self.prev = None
+    def reset(self):
+        self.i = 0.0
+        self.prev = None
+    def step(self, err, dt):
+        self.i += err * dt
+        self.i = max(-self.imax, min(self.imax, self.i))
+        d = 0.0 if self.prev is None else (err - self.prev) / dt
+        self.prev = err
+        return self.kp * err + self.ki * self.i + self.kd * d
+
+# ---------- Датчики ----------
+async def sense():
+    return {
+        'f':     await cargo_dist('front'),
+        'fl':    await cargo_dist('front_left'),
+        'fr':    await cargo_dist('front_right'),
+        'l':     await cargo_dist('left'),
+        'r':     await cargo_dist('right'),
+        'pit':   await cargo_dist('pit'),
+        'pit_l': await cargo_dist('pit_front_left'),
+        'pit_r': await cargo_dist('pit_front_right'),
+    }
+
+# ---------- Основной цикл ----------
+async def main():
+    print('Старт')
+    await cargo_sleep(0.5)
+    yaw0 = (await cargo_gyro())['yaw']
+
+    pid = PID(kp=1.0, ki=0.05, kd=0.30, imax=1.5)
+    f_ema = EMA(alpha=0.5)
+
+    step = 0
+    last_f = None
+    stuck_time = 0.0
+    last_reverse_t = -100.0
+    reverse_until = -1.0
+    reverse_steer = 0.0
+
+    neg_c = neg_l = neg_r = 0
+
+    while step < 4000:
+        t = step * DT
+        gyro = await cargo_gyro()
+        s = await sense()
+
+        f  = dist_ok(s['f'])
+        fl = dist_ok(s['fl'])
+        fr = dist_ok(s['fr'])
+
+        pitch = gyro['pitch']
+        yaw   = gyro['yaw']
+
+        ff = f_ema.update(f)
+        descent = pitch > DESCENT_PITCH
+
+        neg_c = neg_c + 1 if s['pit']   < 0 else 0
+        neg_l = neg_l + 1 if s['pit_l'] < 0 else 0
+        neg_r = neg_r + 1 if s['pit_r'] < 0 else 0
+
+        pit_thr = PIT_CLIFF + (0.6 if descent else 0.0)
+
+        pit_c_haz = (s['pit']   >= 0 and s['pit']   >= pit_thr) or neg_c >= PIT_NEG_STREAK
+        pit_l_haz = (s['pit_l'] >= 0 and s['pit_l'] >= pit_thr) or neg_l >= PIT_NEG_STREAK
+        pit_r_haz = (s['pit_r'] >= 0 and s['pit_r'] >= pit_thr) or neg_r >= PIT_NEG_STREAK
+
+        # ========== РЕЖИМ ЗАДНЕГО ХОДА ==========
+        if t < reverse_until:
+            cargo_steer(reverse_steer)
+            cargo_drive(-75)
+            if step % 5 == 0:
+                print('шаг', step, 'ЗАДНИЙ ХОД')
+            await cargo_sleep(DT); step += 1
+            continue
+
+        # ========== ПРИОРИТЕТ 1: обрыв ==========
+        if pit_c_haz or pit_l_haz or pit_r_haz:
+            if pit_l_haz and not pit_r_haz:
+                steer = 0.9          # обрыв слева → вправо
+            elif pit_r_haz and not pit_l_haz:
+                steer = -0.9         # обрыв справа → влево
+            else:
+                # неоднозначно: уходим туда, где свободнее спереди
+                steer = -0.9 if fl >= fr else 0.9      # ← ИСПРАВЛЕНО
+            cargo_steer(steer)
+            cargo_drive(60)
+            if step % 5 == 0:
+                print('шаг', step, 'ЯМА L/C/R=',
+                      int(pit_l_haz), int(pit_c_haz), int(pit_r_haz),
+                      'pit', round(s['pit'], 2),
+                      'pit_l', round(s['pit_l'], 2),
+                      'pit_r', round(s['pit_r'], 2))
+            await cargo_sleep(DT); step += 1
+            continue
+
+        # ========== Детектор «застревания» ==========
+        if last_f is not None and f < 1.1 and abs(f - last_f) < 0.08:
+            stuck_time += DT
+        else:
+            stuck_time = 0.0
+        last_f = f
+
+        if stuck_time > STUCK_TIME and (t - last_reverse_t) > 2.5:
+            # задний ход, руль — в сторону большей свободы
+            reverse_steer = -0.7 if fl >= fr else 0.7     # ← ИСПРАВЛЕНО
+            reverse_until = t + REVERSE_TIME
+            last_reverse_t = t
+            stuck_time = 0.0
+            pid.reset()
+            cargo_steer(reverse_steer)
+            cargo_drive(-75)
+            if step % 5 == 0:
+                print('шаг', step, 'ЗАСТРЯЛ → НАЗАД')
+            await cargo_sleep(DT); step += 1
+            continue
+
+        # ========== ПРИОРИТЕТ 2: объезд препятствия / бревна ==========
+        # Смотрим минимум из front / front_left / front_right,
+        # чтобы ловить низкие и смещённые в сторону брёвна.
+        f_min = min(f, fl, fr)
+        if f_min < OBS_NEAR:
+            steer = -0.9 if fl >= fr else 0.9             # ← ИСПРАВЛЕНО
+            drive = 50 + int(min(40, f_min * 25))
+            cargo_steer(steer)
+            cargo_drive(drive)
+            if step % 5 == 0:
+                print('шаг', step, 'ОБЪЕЗД',
+                      'F', round(f, 1),
+                      'FL', round(fl, 1),
+                      'FR', round(fr, 1),
+                      'FMIN', round(f_min, 1))
+            await cargo_sleep(DT); step += 1
+            continue
+
+        # ========== ПРИОРИТЕТ 3: удержание курса ==========
+        err = wrap(yaw0 - yaw)
+        cap = 0.4 if f < OBS_MID else 0.7
+        u = pid.step(err, DT)
+        steer = max(-cap, min(cap, u))
+
+        if ff > 4.0:
+            drive = 100
+        elif ff > 2.5:
+            drive = 90
+        else:
+            drive = 75
+
+        cargo_steer(steer)
+        cargo_drive(drive)
+
+        if step % 10 == 0:
+            print('шаг', step, 'КУРС err', round(err, 2),
+                  'F', round(f, 1), 'steer', round(steer, 2),
+                  'drive', drive)
+        await cargo_sleep(DT); step += 1
+
+    cargo_stop()
+    print('Финиш')
+
+await main()
